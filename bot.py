@@ -179,7 +179,13 @@ logger = logging.getLogger(__name__)
 
 # ==================== БАЗА ДАННЫХ ====================
 
-DB_PATH = Path(__file__).parent / "clients.db"
+# Используем /data для постоянного хранилища (не удаляется при обновлении)
+DATA_DIR = Path("/data")
+if DATA_DIR.exists():
+    DB_PATH = DATA_DIR / "clients.db"
+else:
+    # Локально используем текущую папку
+    DB_PATH = Path(__file__).parent / "clients.db"
 
 
 def init_db():
