@@ -597,57 +597,6 @@ async def cmd_staff(message: Message):
     staff_registration[message.from_user.id] = {"step": "code"}
 
 
-@dp.message(F.text)
-async def handle_staff_registration(message: Message):
-    """Обработка регистрации сотрудника"""
-    user_id = message.from_user.id
-    
-    # Проверяем, идёт ли регистрация сотрудника
-    if user_id in staff_registration:
-        reg_data = staff_registration[user_id]
-        
-        if reg_data.get("step") == "code":
-            if message.text == STAFF_SECRET_CODE:
-                staff_registration[user_id] = {"step": "name"}
-                await message.answer(
-                    "✅ Код верный!\n\n"
-                    "Введите ваше имя (как в YClients):",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                del staff_registration[user_id]
-                await message.answer("❌ Неверный код. Попробуйте /staff заново.")
-            return
-        
-        elif reg_data.get("step") == "name":
-            staff_name = message.text.strip()
-            
-            # Сохраняем сотрудника
-            save_staff(
-                telegram_id=user_id,
-                staff_name=staff_name,
-                phone=None
-            )
-            
-            del staff_registration[user_id]
-            
-            await message.answer(
-                f"✅ <b>Вы зарегистрированы как сотрудник!</b>\n\n"
-                f"👤 Имя: {staff_name}\n\n"
-                "Теперь вы будете получать уведомления когда клиенты приходят.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-    
-    # Если не регистрация - обычная обработка
-    await handle_text_fallback(message)
-
-
-async def handle_text_fallback(message: Message):
-    """Обработка обычных текстовых сообщений"""
-    await handle_text_original(message)
-
-
 @dp.message(F.text == "📅 Мои записи")
 async def handle_my_records_button(message: Message):
     await show_my_records(message)
@@ -825,7 +774,49 @@ async def handle_calendar_callback(callback: CallbackQuery):
     await callback.answer("📅 Файл для Apple календаря!")
 
 
-async def handle_text_original(message: Message):
+@dp.message(F.text)
+async def handle_text(message: Message):
+    """Обработка текстовых сообщений"""
+    user_id = message.from_user.id
+    
+    # Проверяем, идёт ли регистрация сотрудника
+    if user_id in staff_registration:
+        reg_data = staff_registration[user_id]
+        
+        if reg_data.get("step") == "code":
+            if message.text == STAFF_SECRET_CODE:
+                staff_registration[user_id] = {"step": "name"}
+                await message.answer(
+                    "✅ Код верный!\n\n"
+                    "Введите ваше имя (как в YClients):",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                del staff_registration[user_id]
+                await message.answer("❌ Неверный код. Попробуйте /staff заново.")
+            return
+        
+        elif reg_data.get("step") == "name":
+            staff_name = message.text.strip()
+            
+            # Сохраняем сотрудника
+            save_staff(
+                telegram_id=user_id,
+                staff_name=staff_name,
+                phone=None
+            )
+            
+            del staff_registration[user_id]
+            
+            await message.answer(
+                f"✅ <b>Вы зарегистрированы как сотрудник!</b>\n\n"
+                f"👤 Имя: {staff_name}\n\n"
+                "Теперь вы будете получать уведомления когда клиенты приходят.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    
+    # Обычная обработка текста
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM clients WHERE telegram_id = ?", (message.from_user.id,))
