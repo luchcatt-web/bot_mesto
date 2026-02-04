@@ -161,7 +161,7 @@ BARBERSHOP_ADDRESS = "ул. Войстроченко, 10"
 BARBERSHOP_PHONE = "+7 (4832) 377-888"
 
 # Интервал проверки записей (в секундах)
-CHECK_INTERVAL = 15  # Проверяем каждые 15 секунд
+CHECK_INTERVAL = 5  # Проверяем каждые 5 секунд
 
 # Минимальный перенос для уведомления (в минутах)
 MIN_RESCHEDULE_MINUTES = 15
@@ -1281,6 +1281,15 @@ async def records_checker():
 
 # ==================== УВЕДОМЛЕНИЯ СОТРУДНИКАМ ====================
 
+def mask_phone(phone: str) -> str:
+    """Маскировка номера телефона: показываем первые 3 и последние 2 цифры"""
+    digits = ''.join(filter(str.isdigit, phone))
+    if len(digits) < 6:
+        return phone
+    # +7 900 *** ** 67
+    return f"+{digits[:3]} *** ** {digits[-2:]}"
+
+
 async def notify_staff_client_arrived(record: dict):
     """Уведомить мастера о приходе его клиента"""
     try:
@@ -1288,6 +1297,9 @@ async def notify_staff_client_arrived(record: dict):
         client = record.get("client") or {}
         client_name = client.get("name", "Клиент") if isinstance(client, dict) else "Клиент"
         client_phone = client.get("phone", "") if isinstance(client, dict) else ""
+        
+        # Маскируем номер телефона
+        masked_phone = mask_phone(client_phone) if client_phone else ""
         
         services_list = record.get("services") or []
         services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
@@ -1303,7 +1315,7 @@ async def notify_staff_client_arrived(record: dict):
         msg = (
             f"🔔 <b>К вам пришёл клиент!</b>\n\n"
             f"👤 {client_name}\n"
-            f"📞 {client_phone}\n"
+            f"📞 {masked_phone}\n"
             f"✂️ {services}\n"
             f"🗓 {time_str}"
         )
