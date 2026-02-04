@@ -1145,13 +1145,12 @@ async def send_record_changed_notification(telegram_id: int, record: dict, old_d
     record_link = get_record_link(record)
     
     text = (
-        f"🔄 <b>Запись перенесена!</b>\n\n"
+        f"Ваша запись перенесена 📅\n\n"
         f"Новое время:\n"
-        f"🗓 <b>{formatted_date}</b>\n"
-        f"✂️ {services}\n"
-        f"👤 {staff_info}\n\n"
-        f"📍 {BARBERSHOP_ADDRESS}\n\n"
-        f"<a href='{record_link}'>Изменить или отменить</a>"
+        f"👉 <b>{formatted_date}</b>\n\n"
+        f"◾ {services}\n"
+        f"к мастеру {staff_info}\n\n"
+        f"Ждём вас в 💈 <b>{BARBERSHOP_NAME.upper()}</b>!"
     )
     
     try:
@@ -1165,10 +1164,15 @@ async def send_record_changed_notification(telegram_id: int, record: dict, old_d
 
 async def send_record_cancelled_notification(telegram_id: int, old_record: dict):
     """Уведомление об отмене записи"""
+    datetime_str = old_record.get("datetime", "")
+    formatted_date = format_record_datetime(datetime_str) if datetime_str else ""
+    
+    date_text = f" на {formatted_date}" if formatted_date else ""
+    
     text = (
-        f"❌ <b>Запись отменена</b>\n\n"
-        f"Ваша запись была отменена.\n\n"
-        f"Хотите записаться снова?"
+        f"Мы отменили запись{date_text} 😔\n\n"
+        f"Будем рады видеть вас снова!\n\n"
+        f"Хотите записаться?"
     )
     
     try:
@@ -1185,29 +1189,31 @@ async def send_reminder_24h(telegram_id: int, record: dict):
     datetime_str = record.get("datetime", "")
     formatted_date = format_record_datetime(datetime_str)
     
+    # Получаем только время для короткого напоминания
+    time_only = ""
+    try:
+        if "T" in datetime_str:
+            dt = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+        time_only = dt.strftime("%H:%M")
+    except:
+        pass
+    
     services_list = record.get("services") or []
     services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
     
     staff = record.get("staff") or {}
     staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
-    staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
-    if not staff_position:
-        staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
-    
-    staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
     
     record_link = get_record_link(record)
     
     text = (
-        f"⏰ <b>Напоминание!</b>\n\n"
-        f"Завтра вы записаны в <b>{BARBERSHOP_NAME}</b>:\n\n"
-        f"✂️ {services}\n"
-        f"👤 {staff_info}\n"
-        f"🗓 <b>{formatted_date}</b>\n\n"
-        f"📍 {BARBERSHOP_ADDRESS}\n"
-        f"📞 {BARBERSHOP_PHONE}\n\n"
-        f"Ждём вас! 💈\n\n"
-        f"<a href='{record_link}'>Изменить или отменить</a>"
+        f"Мы Вас ждём 🤗 завтра в {time_only}\n\n"
+        f"◾ {services}\n"
+        f"к мастеру {staff_name}\n\n"
+        f"📍 {BARBERSHOP_ADDRESS}\n\n"
+        f"До встречи в 💈 <b>{BARBERSHOP_NAME.upper()}</b>!"
     )
     
     try:
