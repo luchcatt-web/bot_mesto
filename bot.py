@@ -762,18 +762,9 @@ def get_google_calendar_url(record: dict) -> str:
 def get_single_record_keyboard(record: dict):
     """Кнопки для конкретной записи с персональной ссылкой"""
     record_link = get_record_link(record)
-    record_id = record.get("id", 0)
-    google_cal_url = get_google_calendar_url(record)
-    
-    # Сохраняем запись в кэш для callback
-    records_cache[str(record_id)] = record
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить / Отменить", url=record_link)],
-        [
-            InlineKeyboardButton(text="📅 Google", url=google_cal_url),
-            InlineKeyboardButton(text="📅 Apple", callback_data=f"calendar_{record_id}")
-        ],
         [InlineKeyboardButton(text="📍 Как добраться", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
     ])
 
