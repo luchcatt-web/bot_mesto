@@ -179,8 +179,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== S3 ХРАНИЛИЩЕ ====================
 
-S3_ACCESS_KEY = "ez123222"
-S3_SECRET_KEY = "BXA0Dyp23tTwbMKgIcrtMA0IyEaKMpjG2tlptQy9"
+S3_ACCESS_KEY = "X0WIIVO2PP8K39TFXMCN"
+S3_SECRET_KEY = "btbb2Go6idj7zYxi4o37RMFrlnXXPYSd8E39cPcB"
 S3_BUCKET = "09756767-976b-412c-8e2b-dc5b155d26a8"
 S3_ENDPOINT = "https://s3.twcstorage.ru"
 S3_DB_KEY = "clients.db"
