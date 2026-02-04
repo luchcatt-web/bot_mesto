@@ -1059,28 +1059,28 @@ async def send_new_record_notification(telegram_id: int, record: dict):
     datetime_str = record.get("datetime", "")
     formatted_date = format_record_datetime(datetime_str)
     
+    # Получаем имя клиента
+    client = record.get("client") or {}
+    client_name = client.get("name", "").split()[0] if isinstance(client, dict) and client.get("name") else ""
+    
     services_list = record.get("services") or []
     services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
     
     staff = record.get("staff") or {}
     staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
-    staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
-    if not staff_position:
-        staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
-    
-    staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
     
     record_link = get_record_link(record)
     
+    # Приветствие с именем
+    greeting = f"👋 {client_name}, вы" if client_name else "👋 Вы"
+    
     text = (
-        f"✅ <b>Вы записаны в {BARBERSHOP_NAME}!</b>\n\n"
-        f"✂️ {services}\n"
-        f"👤 {staff_info}\n"
-        f"🗓 <b>{formatted_date}</b>\n\n"
-        f"📍 {BARBERSHOP_ADDRESS}\n"
-        f"📞 {BARBERSHOP_PHONE}\n\n"
-        f"Ждём вас! 💈\n\n"
-        f"<a href='{record_link}'>Изменить или отменить запись</a>"
+        f"{greeting} записаны в 💈 <b>{BARBERSHOP_NAME.upper()}</b> на услугу\n\n"
+        f"◾ {services}\n"
+        f"к мастеру {staff_name}\n\n"
+        f"👉 на <b>{formatted_date}</b>\n\n"
+        f"С нетерпением ждём вашего визита!\n\n"
+        f"<a href='{record_link}'>изменение записи</a>"
     )
     
     try:
