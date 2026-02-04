@@ -207,20 +207,28 @@ def sync_db_from_s3():
     try:
         import boto3
         from botocore.config import Config
+        from botocore.exceptions import ClientError
+        
+        logger.info(f"Подключаюсь к S3: {S3_ENDPOINT}, bucket: {S3_BUCKET}")
         
         s3 = boto3.client(
             's3',
             endpoint_url=S3_ENDPOINT,
             aws_access_key_id=S3_ACCESS_KEY,
             aws_secret_access_key=S3_SECRET_KEY,
+            region_name='ru-1',
             config=Config(signature_version='s3v4')
         )
         
         s3.download_file(S3_BUCKET, S3_DB_KEY, str(DB_PATH))
         logger.info("✅ База данных загружена из S3")
         return True
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.info(f"S3 ClientError ({error_code}): {e}")
+        return False
     except Exception as e:
-        logger.info(f"База в S3 не найдена или ошибка: {e}")
+        logger.info(f"S3 ошибка загрузки: {type(e).__name__}: {e}")
         return False
 
 
@@ -229,20 +237,28 @@ def sync_db_to_s3():
     try:
         import boto3
         from botocore.config import Config
+        from botocore.exceptions import ClientError
+        
+        logger.info("Сохраняю базу в S3...")
         
         s3 = boto3.client(
             's3',
             endpoint_url=S3_ENDPOINT,
             aws_access_key_id=S3_ACCESS_KEY,
             aws_secret_access_key=S3_SECRET_KEY,
+            region_name='ru-1',
             config=Config(signature_version='s3v4')
         )
         
         s3.upload_file(str(DB_PATH), S3_BUCKET, S3_DB_KEY)
         logger.info("✅ База данных сохранена в S3")
         return True
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(f"S3 ClientError ({error_code}): {e}")
+        return False
     except Exception as e:
-        logger.error(f"Ошибка сохранения в S3: {e}")
+        logger.error(f"S3 ошибка сохранения: {type(e).__name__}: {e}")
         return False
 
 
