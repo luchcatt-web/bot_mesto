@@ -1,0 +1,827 @@
+"""
+Telegram бот для барбершопа с интеграцией YClients.
+- Собирает контакты клиентов через QR-код
+- Мгновенные уведомления о новых записях
+- Уведомления об изменении/отмене записи
+- Напоминания за 24 часа и 2 часа до визита
+"""
+
+import asyncio
+import logging
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.enums import ParseMode
+
+# ==================== НАСТРОЙКИ ====================
+
+# Telegram Bot
+BOT_TOKEN = "8579638826:AAHg2YB8IQmc08VOQdS8TS6EVsYRS28ZQgE"
+
+# YClients API
+YCLIENTS_PARTNER_TOKEN = "befz68u9gpj6n3ut5zrs"
+YCLIENTS_USER_TOKEN = "7ab80bc153a8328ecfae9b339b30b804"
+YCLIENTS_COMPANY_ID = "1540716"
+
+# Ссылка на онлайн-запись
+YCLIENTS_BOOKING_URL = "https://n1729941.yclients.com"
+
+# Настройки барбершопа
+BARBERSHOP_NAME = "Место"
+BARBERSHOP_ADDRESS = "ул. Войстроченко, 10"
+BARBERSHOP_PHONE = "+7 (4832) 377-888"
+
+# Интервал проверки записей (в секундах)
+CHECK_INTERVAL = 60  # Проверяем каждую минуту
+
+# Минимальный перенос для уведомления (в минутах)
+MIN_RESCHEDULE_MINUTES = 15
+
+# ==================== ЛОГИРОВАНИЕ ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ==================== БАЗА ДАННЫХ ====================
+
+DB_PATH = Path(__file__).parent / "clients.db"
+
+
+def init_db():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Таблица клиентов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            phone_number TEXT NOT NULL,
+            first_name TEXT,
+            last_name TEXT,
+            username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Таблица для отслеживания записей (для обнаружения изменений)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tracked_records (
+            record_id INTEGER PRIMARY KEY,
+            client_phone TEXT,
+            datetime TEXT,
+            services TEXT,
+            staff_name TEXT,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Таблица отправленных уведомлений
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sent_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            notification_type TEXT NOT NULL,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(record_id, notification_type)
+        )
+    """)
+    
+    # Индекс для быстрого поиска по телефону
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_phone ON clients(phone_number)
+    """)
+    
+    conn.commit()
+    conn.close()
+    logger.info("База данных инициализирована")
+
+
+def save_client(telegram_id: int, phone: str, first_name: str = None,
+                last_name: str = None, username: str = None):
+    """Сохранение клиента"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    phone = normalize_phone(phone)
+    
+    try:
+        cursor.execute("""
+            INSERT INTO clients (telegram_id, phone_number, first_name, last_name, username)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                phone_number = excluded.phone_number,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                username = excluded.username
+        """, (telegram_id, phone, first_name, last_name, username))
+        conn.commit()
+        logger.info(f"Клиент сохранён: {phone} (Telegram ID: {telegram_id})")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения клиента: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_telegram_id_by_phone(phone: str):
+    """Получение Telegram ID по номеру телефона"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    phone_clean = ''.join(filter(str.isdigit, phone))[-10:]
+    
+    cursor.execute(
+        "SELECT telegram_id FROM clients WHERE phone_number LIKE ?",
+        (f"%{phone_clean}",)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def get_tracked_record(record_id: int):
+    """Получить сохранённую запись"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tracked_records WHERE record_id = ?", (record_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+
+def save_tracked_record(record_id: int, client_phone: str, datetime_str: str, 
+                        services: str, staff_name: str, status: str = "active"):
+    """Сохранить запись для отслеживания"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO tracked_records (record_id, client_phone, datetime, services, staff_name, status, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(record_id) DO UPDATE SET
+            datetime = excluded.datetime,
+            services = excluded.services,
+            staff_name = excluded.staff_name,
+            status = excluded.status,
+            updated_at = CURRENT_TIMESTAMP
+    """, (record_id, client_phone, datetime_str, services, staff_name, status))
+    conn.commit()
+    conn.close()
+
+
+def get_all_tracked_record_ids():
+    """Получить все ID отслеживаемых записей"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT record_id, datetime FROM tracked_records WHERE status = 'active'")
+    results = cursor.fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in results}
+
+
+def mark_record_cancelled(record_id: int):
+    """Отметить запись как отменённую"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE tracked_records SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE record_id = ?",
+        (record_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_notification_sent(record_id: int, notification_type: str) -> bool:
+    """Проверка, было ли отправлено уведомление"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM sent_notifications WHERE record_id = ? AND notification_type = ?",
+        (record_id, notification_type)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+
+def mark_notification_sent(record_id: int, notification_type: str):
+    """Отметить уведомление как отправленное"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR IGNORE INTO sent_notifications (record_id, notification_type) VALUES (?, ?)",
+        (record_id, notification_type)
+    )
+    conn.commit()
+    conn.close()
+
+
+def normalize_phone(phone: str) -> str:
+    """Нормализация номера телефона"""
+    digits = ''.join(filter(str.isdigit, phone))
+    if len(digits) == 11 and digits.startswith('8'):
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    return '+' + digits
+
+
+# ==================== YCLIENTS API ====================
+
+class YClientsAPI:
+    """Клиент для работы с API YClients"""
+    
+    BASE_URL = "https://api.yclients.com/api/v1"
+    
+    def __init__(self, partner_token: str, user_token: str, company_id: str):
+        self.partner_token = partner_token
+        self.user_token = user_token
+        self.company_id = company_id
+    
+    def _headers(self) -> dict:
+        return {
+            "Accept": "application/vnd.yclients.v2+json",
+            "Authorization": f"Bearer {self.partner_token}, User {self.user_token}",
+            "Content-Type": "application/json"
+        }
+    
+    async def get_records(self, date_from: str, date_to: str) -> list:
+        """Получение записей за период"""
+        url = f"{self.BASE_URL}/records/{self.company_id}"
+        params = {
+            "start_date": date_from,
+            "end_date": date_to,
+            "count": 500
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self._headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("data", [])
+                    else:
+                        logger.error(f"YClients API error: {resp.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"YClients API exception: {e}")
+            return []
+    
+    async def get_upcoming_records(self) -> list:
+        """Получение записей на ближайшие 7 дней"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        week_later = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        return await self.get_records(today, week_later)
+    
+    async def get_visit_link(self, record_id: int) -> str:
+        """Получение ссылки на визит для клиента"""
+        # Пробуем получить через API визитов
+        url = f"{self.BASE_URL}/visits/{self.company_id}/{record_id}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self._headers()) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        visit_data = data.get("data", {})
+                        
+                        # Ищем ссылку в данных визита
+                        for field in ['client_link', 'short_link', 'link', 'url']:
+                            if visit_data.get(field):
+                                return visit_data.get(field)
+        except Exception as e:
+            logger.error(f"Ошибка получения ссылки визита: {e}")
+        
+        return None
+
+
+# ==================== TELEGRAM BOT ====================
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+yclients = YClientsAPI(YCLIENTS_PARTNER_TOKEN, YCLIENTS_USER_TOKEN, YCLIENTS_COMPANY_ID)
+
+
+def get_contact_keyboard():
+    """Клавиатура с кнопкой для отправки контакта"""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
+def get_main_keyboard():
+    """Главное меню"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Мои записи")],
+            [KeyboardButton(text="✏️ Записаться"), KeyboardButton(text="📞 Связаться")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def get_record_keyboard():
+    """Inline кнопки для записи"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить / Отменить", url=YCLIENTS_BOOKING_URL)],
+        [InlineKeyboardButton(text="📍 Как добраться", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
+    ])
+
+
+def get_booking_keyboard():
+    """Кнопка записи"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Записаться онлайн", url=YCLIENTS_BOOKING_URL)]
+    ])
+
+
+# ==================== ОБРАБОТЧИКИ ====================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    """Команда /start"""
+    await message.answer(
+        f"👋 Добро пожаловать в <b>{BARBERSHOP_NAME}</b>!\n\n"
+        "Чтобы получать уведомления о записях, "
+        "поделитесь своим номером телефона.\n\n"
+        f"📍 {BARBERSHOP_ADDRESS}\n"
+        f"📞 {BARBERSHOP_PHONE}\n\n"
+        "🔒 Номер используется только для уведомлений.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_contact_keyboard()
+    )
+
+
+@dp.message(Command("myrecords"))
+async def cmd_my_records(message: Message):
+    await show_my_records(message)
+
+
+@dp.message(F.text == "📅 Мои записи")
+async def handle_my_records_button(message: Message):
+    await show_my_records(message)
+
+
+async def show_my_records(message: Message):
+    """Показать записи клиента"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone_number FROM clients WHERE telegram_id = ?", (message.from_user.id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        await message.answer(
+            "❌ Вы ещё не зарегистрированы.\nПоделитесь номером телефона:",
+            reply_markup=get_contact_keyboard()
+        )
+        return
+    
+    phone = result[0]
+    phone_clean = phone[-10:]
+    
+    try:
+        records = await yclients.get_upcoming_records()
+    except Exception as e:
+        logger.error(f"Ошибка получения записей: {e}")
+        await message.answer("😔 Не удалось загрузить записи. Попробуйте позже.", reply_markup=get_main_keyboard())
+        return
+    
+    if not records:
+        await message.answer(
+            "📅 У вас нет предстоящих записей.",
+            reply_markup=get_main_keyboard()
+        )
+        await message.answer("Хотите записаться?", reply_markup=get_booking_keyboard())
+        return
+    
+    my_records = []
+    for r in records:
+        if not r or not isinstance(r, dict):
+            continue
+        client = r.get("client")
+        if client and isinstance(client, dict):
+            client_phone = client.get("phone", "")
+            if client_phone and client_phone[-10:] == phone_clean:
+                my_records.append(r)
+    
+    if not my_records:
+        await message.answer(
+            "📅 У вас нет предстоящих записей.",
+            reply_markup=get_main_keyboard()
+        )
+        await message.answer("Хотите записаться?", reply_markup=get_booking_keyboard())
+        return
+    
+    # Отправляем каждую запись отдельным сообщением с персональной ссылкой
+    await message.answer(f"📅 <b>Ваши записи ({len(my_records)}):</b>", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    
+    for record in my_records:
+        date = record.get("date", "")
+        datetime_str = record.get("datetime", "")
+        time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+        services_list = record.get("services") or []
+        services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+        staff = record.get("staff") or {}
+        staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+        record_link = get_record_link(record)
+        
+        text = (
+            f"🗓 <b>{date}</b> в <b>{time_str}</b>\n"
+            f"✂️ {services}\n"
+            f"👤 {staff_name}\n\n"
+            f"<a href='{record_link}'>Изменить или отменить</a>"
+        )
+        
+        await message.answer(
+            text, 
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_single_record_keyboard(record)
+        )
+
+
+@dp.message(F.contact)
+async def handle_contact(message: Message):
+    """Обработчик контакта"""
+    contact = message.contact
+    
+    if contact.user_id != message.from_user.id:
+        await message.answer("⚠️ Отправьте свой контакт.", reply_markup=get_contact_keyboard())
+        return
+    
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    
+    if save_client(message.from_user.id, phone, contact.first_name, contact.last_name, message.from_user.username):
+        await message.answer(
+            f"✅ Отлично, {contact.first_name or 'друг'}!\n\n"
+            f"Номер <code>{phone}</code> сохранён.\n\n"
+            "Теперь вы будете получать:\n"
+            "• 📲 Уведомление сразу при записи\n"
+            "• 🔄 Уведомление при изменении/отмене\n"
+            "• ⏰ Напоминание за 24 часа\n\n"
+            f"Ждём вас в <b>{BARBERSHOP_NAME}</b>! 💈",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer("😔 Ошибка. Попробуйте ещё раз.", reply_markup=get_contact_keyboard())
+
+
+@dp.message(F.text == "✏️ Записаться")
+async def handle_booking_button(message: Message):
+    await message.answer(
+        f"📅 Запишитесь в <b>{BARBERSHOP_NAME}</b>!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_booking_keyboard()
+    )
+
+
+@dp.message(F.text == "📞 Связаться")
+async def handle_contact_button(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:+74832377888")],
+        [InlineKeyboardButton(text="📍 На карте", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
+    ])
+    await message.answer(
+        f"📍 <b>{BARBERSHOP_NAME}</b>\n\n"
+        f"🏠 {BARBERSHOP_ADDRESS}\n"
+        f"📞 {BARBERSHOP_PHONE}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM clients WHERE telegram_id = ?", (message.from_user.id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        await message.answer("Выберите действие:", reply_markup=get_main_keyboard())
+    else:
+        await message.answer("Поделитесь номером телефона:", reply_markup=get_contact_keyboard())
+
+
+# ==================== УВЕДОМЛЕНИЯ ====================
+
+def get_record_link(record: dict) -> str:
+    """Получить ссылку на изменение записи"""
+    # Проверяем все возможные поля со ссылкой
+    for field in ['visit_url', 'client_link', 'short_link', 'record_link', 'link', 'links']:
+        if record.get(field):
+            link = record.get(field)
+            if isinstance(link, str) and link.startswith('http'):
+                return link
+            elif isinstance(link, dict) and link.get('client'):
+                return link.get('client')
+    
+    # Проверяем вложенные объекты
+    if record.get("visit") and isinstance(record.get("visit"), dict):
+        visit = record.get("visit")
+        for field in ['url', 'link', 'short_link']:
+            if visit.get(field):
+                return visit.get(field)
+    
+    # Формируем ссылку через ID записи
+    record_id = record.get("id")
+    visit_id = record.get("visit_id")
+    
+    # Формат для мобильной версии YClients
+    if visit_id:
+        return f"{YCLIENTS_BOOKING_URL}/loyalty/record/{visit_id}"
+    elif record_id:
+        return f"{YCLIENTS_BOOKING_URL}/loyalty/record/{record_id}"
+    
+    return YCLIENTS_BOOKING_URL
+
+
+def get_single_record_keyboard(record: dict):
+    """Кнопки для конкретной записи с персональной ссылкой"""
+    record_link = get_record_link(record)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить / Отменить", url=record_link)],
+        [InlineKeyboardButton(text="📍 Как добраться", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
+    ])
+
+
+async def send_new_record_notification(telegram_id: int, record: dict):
+    """Уведомление о новой записи"""
+    date = record.get("date", "")
+    datetime_str = record.get("datetime", "")
+    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    services_list = record.get("services") or []
+    services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    staff = record.get("staff") or {}
+    staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    record_link = get_record_link(record)
+    
+    text = (
+        f"✅ <b>Вы записаны в {BARBERSHOP_NAME}!</b>\n\n"
+        f"✂️ {services}\n"
+        f"👤 Мастер: {staff_name}\n\n"
+        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n\n"
+        f"📍 {BARBERSHOP_ADDRESS}\n"
+        f"📞 {BARBERSHOP_PHONE}\n\n"
+        f"Ждём вас! 💈\n\n"
+        f"<a href='{record_link}'>Изменить или отменить запись</a>"
+    )
+    
+    try:
+        await bot.send_message(
+            telegram_id, 
+            text, 
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_single_record_keyboard(record),
+            disable_web_page_preview=False
+        )
+        logger.info(f"Уведомление о записи отправлено: {telegram_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return False
+
+
+async def send_record_changed_notification(telegram_id: int, record: dict, old_datetime: str):
+    """Уведомление об изменении записи"""
+    date = record.get("date", "")
+    datetime_str = record.get("datetime", "")
+    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    services_list = record.get("services") or []
+    services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    staff = record.get("staff") or {}
+    staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    record_link = get_record_link(record)
+    
+    text = (
+        f"🔄 <b>Запись перенесена!</b>\n\n"
+        f"Новое время:\n"
+        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n"
+        f"✂️ {services}\n"
+        f"👤 Мастер: {staff_name}\n\n"
+        f"📍 {BARBERSHOP_ADDRESS}\n\n"
+        f"<a href='{record_link}'>Изменить или отменить</a>"
+    )
+    
+    try:
+        await bot.send_message(telegram_id, text, parse_mode=ParseMode.HTML, reply_markup=get_single_record_keyboard(record))
+        logger.info(f"Уведомление об изменении отправлено: {telegram_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return False
+
+
+async def send_record_cancelled_notification(telegram_id: int, old_record: dict):
+    """Уведомление об отмене записи"""
+    text = (
+        f"❌ <b>Запись отменена</b>\n\n"
+        f"Ваша запись была отменена.\n\n"
+        f"Хотите записаться снова?"
+    )
+    
+    try:
+        await bot.send_message(telegram_id, text, parse_mode=ParseMode.HTML, reply_markup=get_booking_keyboard())
+        logger.info(f"Уведомление об отмене отправлено: {telegram_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return False
+
+
+async def send_reminder_24h(telegram_id: int, record: dict):
+    """Напоминание за 24 часа"""
+    date = record.get("date", "")
+    datetime_str = record.get("datetime", "")
+    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    services_list = record.get("services") or []
+    services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    staff = record.get("staff") or {}
+    staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    record_link = get_record_link(record)
+    
+    text = (
+        f"⏰ <b>Напоминание!</b>\n\n"
+        f"Завтра вы записаны в <b>{BARBERSHOP_NAME}</b>:\n\n"
+        f"✂️ {services}\n"
+        f"👤 Мастер: {staff_name}\n"
+        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n\n"
+        f"📍 {BARBERSHOP_ADDRESS}\n"
+        f"📞 {BARBERSHOP_PHONE}\n\n"
+        f"Ждём вас! 💈\n\n"
+        f"<a href='{record_link}'>Изменить или отменить</a>"
+    )
+    
+    try:
+        await bot.send_message(telegram_id, text, parse_mode=ParseMode.HTML, reply_markup=get_single_record_keyboard(record))
+        logger.info(f"Напоминание 24ч отправлено: {telegram_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return False
+
+
+# ==================== ОТСЛЕЖИВАНИЕ ЗАПИСЕЙ ====================
+
+async def check_records():
+    """Проверка записей и отправка уведомлений"""
+    logger.info("Проверка записей...")
+    
+    records = await yclients.get_upcoming_records()
+    if not records:
+        return
+    
+    now = datetime.now()
+    current_record_ids = set()
+    
+    for record in records:
+        if not record or not isinstance(record, dict):
+            continue
+        
+        record_id = record.get("id")
+        if not record_id:
+            continue
+        
+        current_record_ids.add(record_id)
+        
+        client = record.get("client")
+        if not client or not isinstance(client, dict):
+            continue
+        
+        client_phone = client.get("phone", "")
+        if not client_phone:
+            continue
+        
+        telegram_id = get_telegram_id_by_phone(client_phone)
+        if not telegram_id:
+            continue
+        
+        datetime_str = record.get("datetime", "")
+        services_list = record.get("services") or []
+        services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+        staff = record.get("staff") or {}
+        staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+        
+        # Логируем полную структуру первой записи для поиска ссылки
+        if len(current_record_ids) == 1:
+            logger.info(f"=== ПОЛНЫЕ ДАННЫЕ ЗАПИСИ #{record_id} ===")
+            logger.info(json.dumps(record, ensure_ascii=False, indent=2, default=str))
+        
+        # Получаем сохранённую запись
+        tracked = get_tracked_record(record_id)
+        
+        if tracked is None:
+            # Новая запись!
+            if not is_notification_sent(record_id, "new"):
+                if await send_new_record_notification(telegram_id, record):
+                    mark_notification_sent(record_id, "new")
+            
+            save_tracked_record(record_id, client_phone, datetime_str, services, staff_name)
+        
+        else:
+            # Проверяем изменение времени
+            old_datetime = tracked[2]  # datetime из БД
+            
+            if old_datetime and datetime_str and old_datetime != datetime_str:
+                # Проверяем разницу во времени
+                try:
+                    old_dt = datetime.fromisoformat(old_datetime.replace("Z", "+00:00")).replace(tzinfo=None)
+                    new_dt = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    diff_minutes = abs((new_dt - old_dt).total_seconds() / 60)
+                    
+                    if diff_minutes >= MIN_RESCHEDULE_MINUTES:
+                        notification_key = f"changed_{datetime_str}"
+                        if not is_notification_sent(record_id, notification_key):
+                            if await send_record_changed_notification(telegram_id, record, old_datetime):
+                                mark_notification_sent(record_id, notification_key)
+                except:
+                    pass
+            
+            # Обновляем запись
+            save_tracked_record(record_id, client_phone, datetime_str, services, staff_name)
+        
+        # Проверяем напоминание за 24 часа
+        if datetime_str:
+            try:
+                record_time = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                hours_until = (record_time - now).total_seconds() / 3600
+                
+                # Напоминание за 24 часа (окно 23-25 часов)
+                if 23 <= hours_until <= 25:
+                    if not is_notification_sent(record_id, "reminder_24h"):
+                        if await send_reminder_24h(telegram_id, record):
+                            mark_notification_sent(record_id, "reminder_24h")
+            except:
+                pass
+    
+    # Проверяем отменённые записи
+    tracked_ids = get_all_tracked_record_ids()
+    for record_id, old_datetime in tracked_ids.items():
+        if record_id not in current_record_ids:
+            # Запись исчезла — отменена!
+            tracked = get_tracked_record(record_id)
+            if tracked:
+                client_phone = tracked[1]
+                telegram_id = get_telegram_id_by_phone(client_phone)
+                
+                if telegram_id and not is_notification_sent(record_id, "cancelled"):
+                    if await send_record_cancelled_notification(telegram_id, {"datetime": old_datetime}):
+                        mark_notification_sent(record_id, "cancelled")
+                
+                mark_record_cancelled(record_id)
+
+
+async def records_checker():
+    """Планировщик проверки записей"""
+    while True:
+        try:
+            await check_records()
+        except Exception as e:
+            logger.error(f"Ошибка проверки записей: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ==================== ЗАПУСК ====================
+
+async def main():
+    """Запуск бота"""
+    init_db()
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем проверку записей
+    asyncio.create_task(records_checker())
+    
+    logger.info("🚀 Бот запущен!")
+    logger.info(f"⏱ Проверка записей каждые {CHECK_INTERVAL} сек")
+    
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
