@@ -10,8 +10,53 @@ import asyncio
 import logging
 import sqlite3
 import json
+import locale
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Устанавливаем русскую локаль для дней недели
+try:
+    locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
+except:
+    pass
+
+# Дни недели на русском
+WEEKDAYS_RU = {
+    0: 'понедельник',
+    1: 'вторник', 
+    2: 'среда',
+    3: 'четверг',
+    4: 'пятница',
+    5: 'суббота',
+    6: 'воскресенье'
+}
+
+MONTHS_RU = {
+    1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
+    5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
+    9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
+}
+
+
+def format_record_datetime(datetime_str: str) -> str:
+    """Форматирование даты и времени записи: '5 февраля (среда) в 13:30'"""
+    if not datetime_str:
+        return ""
+    
+    try:
+        if "T" in datetime_str:
+            dt = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%d")
+        
+        day = dt.day
+        month = MONTHS_RU.get(dt.month, "")
+        weekday = WEEKDAYS_RU.get(dt.weekday(), "")
+        time_str = dt.strftime("%H:%M")
+        
+        return f"{day} {month} ({weekday}) в {time_str}"
+    except:
+        return datetime_str
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -438,19 +483,26 @@ async def show_my_records(message: Message):
     await message.answer(f"📅 <b>Ваши записи ({len(my_records)}):</b>", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
     
     for record in my_records:
-        date = record.get("date", "")
         datetime_str = record.get("datetime", "")
-        time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+        formatted_date = format_record_datetime(datetime_str)
+        
         services_list = record.get("services") or []
         services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+        
         staff = record.get("staff") or {}
         staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+        staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
+        if not staff_position:
+            staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
+        
+        staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
+        
         record_link = get_record_link(record)
         
         text = (
-            f"🗓 <b>{date}</b> в <b>{time_str}</b>\n"
+            f"🗓 <b>{formatted_date}</b>\n"
             f"✂️ {services}\n"
-            f"👤 {staff_name}\n\n"
+            f"👤 {staff_info}\n\n"
             f"<a href='{record_link}'>Изменить или отменить</a>"
         )
         
@@ -572,20 +624,27 @@ def get_single_record_keyboard(record: dict):
 
 async def send_new_record_notification(telegram_id: int, record: dict):
     """Уведомление о новой записи"""
-    date = record.get("date", "")
     datetime_str = record.get("datetime", "")
-    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    formatted_date = format_record_datetime(datetime_str)
+    
     services_list = record.get("services") or []
     services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    
     staff = record.get("staff") or {}
     staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
+    if not staff_position:
+        staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
+    
+    staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
+    
     record_link = get_record_link(record)
     
     text = (
         f"✅ <b>Вы записаны в {BARBERSHOP_NAME}!</b>\n\n"
         f"✂️ {services}\n"
-        f"👤 Мастер: {staff_name}\n\n"
-        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n\n"
+        f"👤 {staff_info}\n"
+        f"🗓 <b>{formatted_date}</b>\n\n"
         f"📍 {BARBERSHOP_ADDRESS}\n"
         f"📞 {BARBERSHOP_PHONE}\n\n"
         f"Ждём вас! 💈\n\n"
@@ -609,21 +668,28 @@ async def send_new_record_notification(telegram_id: int, record: dict):
 
 async def send_record_changed_notification(telegram_id: int, record: dict, old_datetime: str):
     """Уведомление об изменении записи"""
-    date = record.get("date", "")
     datetime_str = record.get("datetime", "")
-    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    formatted_date = format_record_datetime(datetime_str)
+    
     services_list = record.get("services") or []
     services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    
     staff = record.get("staff") or {}
     staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
+    if not staff_position:
+        staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
+    
+    staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
+    
     record_link = get_record_link(record)
     
     text = (
         f"🔄 <b>Запись перенесена!</b>\n\n"
         f"Новое время:\n"
-        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n"
+        f"🗓 <b>{formatted_date}</b>\n"
         f"✂️ {services}\n"
-        f"👤 Мастер: {staff_name}\n\n"
+        f"👤 {staff_info}\n\n"
         f"📍 {BARBERSHOP_ADDRESS}\n\n"
         f"<a href='{record_link}'>Изменить или отменить</a>"
     )
@@ -656,21 +722,28 @@ async def send_record_cancelled_notification(telegram_id: int, old_record: dict)
 
 async def send_reminder_24h(telegram_id: int, record: dict):
     """Напоминание за 24 часа"""
-    date = record.get("date", "")
     datetime_str = record.get("datetime", "")
-    time_str = datetime_str.split("T")[1][:5] if "T" in datetime_str else ""
+    formatted_date = format_record_datetime(datetime_str)
+    
     services_list = record.get("services") or []
     services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    
     staff = record.get("staff") or {}
     staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    staff_position = staff.get("specialization", "") if isinstance(staff, dict) else ""
+    if not staff_position:
+        staff_position = staff.get("position", {}).get("title", "") if isinstance(staff.get("position"), dict) else ""
+    
+    staff_info = f"{staff_name}, {staff_position}" if staff_position else staff_name
+    
     record_link = get_record_link(record)
     
     text = (
         f"⏰ <b>Напоминание!</b>\n\n"
         f"Завтра вы записаны в <b>{BARBERSHOP_NAME}</b>:\n\n"
         f"✂️ {services}\n"
-        f"👤 Мастер: {staff_name}\n"
-        f"🗓 <b>{date}</b> в <b>{time_str}</b>\n\n"
+        f"👤 {staff_info}\n"
+        f"🗓 <b>{formatted_date}</b>\n\n"
         f"📍 {BARBERSHOP_ADDRESS}\n"
         f"📞 {BARBERSHOP_PHONE}\n\n"
         f"Ждём вас! 💈\n\n"
