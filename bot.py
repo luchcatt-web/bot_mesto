@@ -1135,11 +1135,14 @@ async def send_reminder_24h(telegram_id: int, record: dict):
 
 async def check_records():
     """Проверка записей и отправка уведомлений"""
-    logger.info("Проверка записей...")
+    logger.info("=== Проверка записей ===")
     
     records = await yclients.get_upcoming_records()
     if not records:
+        logger.info("Записей не найдено")
         return
+    
+    logger.info(f"Найдено {len(records)} записей")
     
     now = datetime.now()
     current_record_ids = set()
@@ -1159,12 +1162,18 @@ async def check_records():
             continue
         
         client_phone = client.get("phone", "")
+        client_name = client.get("name", "Неизвестно")
+        
         if not client_phone:
+            logger.info(f"Запись #{record_id}: нет телефона у клиента {client_name}")
             continue
         
         telegram_id = get_telegram_id_by_phone(client_phone)
         if not telegram_id:
-            continue
+            logger.info(f"Запись #{record_id}: клиент {client_name} ({client_phone}) не в боте")
+            # Продолжаем обработку даже если клиент не в боте (для отслеживания attendance)
+        
+        logger.info(f"Запись #{record_id}: {client_name}, телефон {client_phone}, telegram_id={telegram_id}")
         
         datetime_str = record.get("datetime", "")
         services_list = record.get("services") or []
@@ -1182,9 +1191,18 @@ async def check_records():
         
         if tracked is None:
             # Новая запись!
-            if not is_notification_sent(record_id, "new"):
-                if await send_new_record_notification(telegram_id, record):
-                    mark_notification_sent(record_id, "new")
+            logger.info(f"Новая запись #{record_id} найдена!")
+            
+            if telegram_id:
+                if not is_notification_sent(record_id, "new"):
+                    logger.info(f"Отправляем уведомление клиенту {telegram_id}")
+                    if await send_new_record_notification(telegram_id, record):
+                        mark_notification_sent(record_id, "new")
+                        logger.info(f"Уведомление о записи #{record_id} отправлено!")
+                    else:
+                        logger.error(f"Не удалось отправить уведомление о записи #{record_id}")
+            else:
+                logger.info(f"Клиент записи #{record_id} не в боте - уведомление не отправлено")
             
             save_tracked_record(record_id, client_phone, datetime_str, services, staff_name)
         
@@ -1192,7 +1210,7 @@ async def check_records():
             # Проверяем изменение времени
             old_datetime = tracked[2]  # datetime из БД
             
-            if old_datetime and datetime_str and old_datetime != datetime_str:
+            if telegram_id and old_datetime and datetime_str and old_datetime != datetime_str:
                 # Проверяем разницу во времени
                 try:
                     old_dt = datetime.fromisoformat(old_datetime.replace("Z", "+00:00")).replace(tzinfo=None)
