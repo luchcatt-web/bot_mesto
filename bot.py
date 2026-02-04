@@ -161,7 +161,7 @@ BARBERSHOP_ADDRESS = "ул. Войстроченко, 10"
 BARBERSHOP_PHONE = "+7 (4832) 377-888"
 
 # Интервал проверки записей (в секундах)
-CHECK_INTERVAL = 60  # Проверяем каждую минуту
+CHECK_INTERVAL = 30  # Проверяем каждые 30 секунд
 
 # Минимальный перенос для уведомления (в минутах)
 MIN_RESCHEDULE_MINUTES = 15
@@ -496,6 +496,23 @@ class YClientsAPI:
         week_later = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
         return await self.get_records(today, week_later)
     
+    async def get_staff_list(self) -> list:
+        """Получение списка мастеров"""
+        url = f"{self.BASE_URL}/company/{self.company_id}/staff"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self._headers()) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("data", [])
+                    else:
+                        logger.error(f"YClients Staff API error: {resp.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"YClients Staff API exception: {e}")
+            return []
+    
     async def get_visit_link(self, record_id: int) -> str:
         """Получение ссылки на визит для клиента"""
         # Пробуем получить через API визитов
@@ -591,10 +608,43 @@ async def cmd_staff(message: Message):
     """Команда /staff для регистрации сотрудников"""
     await message.answer(
         "👨‍💼 <b>Регистрация сотрудника</b>\n\n"
-        "Введите секретный код для регистрации:",
+        "Введите секретный код:",
         parse_mode=ParseMode.HTML
     )
     staff_registration[message.from_user.id] = {"step": "code"}
+
+
+@dp.callback_query(F.data.startswith("staff_select_"))
+async def handle_staff_select(callback: CallbackQuery):
+    """Обработка выбора мастера при регистрации"""
+    staff_id = int(callback.data.replace("staff_select_", ""))
+    user_id = callback.from_user.id
+    
+    if user_id not in staff_registration:
+        await callback.answer("❌ Сессия истекла. Начните заново /staff")
+        return
+    
+    # Получаем имя из сохранённого словаря
+    staff_names = staff_registration[user_id].get("staff_names", {})
+    staff_name = staff_names.get(staff_id, "Мастер")
+    
+    # Сохраняем сотрудника с YClients ID
+    save_staff(
+        telegram_id=user_id,
+        staff_name=staff_name,
+        yclients_staff_id=staff_id,
+        phone=None
+    )
+    
+    del staff_registration[user_id]
+    
+    await callback.message.edit_text(
+        f"✅ <b>Вы зарегистрированы!</b>\n\n"
+        f"👤 {staff_name}\n\n"
+        "Теперь уведомления о приходе ваших клиентов будут приходить вам.",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("✅ Готово!")
 
 
 @dp.message(F.text == "📅 Мои записи")
@@ -785,35 +835,38 @@ async def handle_text(message: Message):
         
         if reg_data.get("step") == "code":
             if message.text == STAFF_SECRET_CODE:
-                staff_registration[user_id] = {"step": "name"}
+                # Получаем список мастеров из YClients
+                staff_list = await yclients.get_staff_list()
+                
+                if not staff_list:
+                    await message.answer("❌ Не удалось загрузить список мастеров. Попробуйте позже.")
+                    del staff_registration[user_id]
+                    return
+                
+                # Создаём кнопки для выбора мастера
+                buttons = []
+                staff_names = {}  # Сохраняем имена для callback
+                for staff in staff_list:
+                    staff_id = staff.get("id")
+                    staff_name = staff.get("name", "Без имени")
+                    staff_names[staff_id] = staff_name
+                    buttons.append([InlineKeyboardButton(
+                        text=f"👤 {staff_name}",
+                        callback_data=f"staff_select_{staff_id}"
+                    )])
+                
+                staff_registration[user_id] = {"step": "select", "staff_names": staff_names}
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+                
                 await message.answer(
                     "✅ Код верный!\n\n"
-                    "Введите ваше имя (как в YClients):",
-                    parse_mode=ParseMode.HTML
+                    "Выберите себя из списка мастеров:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard
                 )
             else:
                 del staff_registration[user_id]
                 await message.answer("❌ Неверный код. Попробуйте /staff заново.")
-            return
-        
-        elif reg_data.get("step") == "name":
-            staff_name = message.text.strip()
-            
-            # Сохраняем сотрудника
-            save_staff(
-                telegram_id=user_id,
-                staff_name=staff_name,
-                phone=None
-            )
-            
-            del staff_registration[user_id]
-            
-            await message.answer(
-                f"✅ <b>Вы зарегистрированы как сотрудник!</b>\n\n"
-                f"👤 Имя: {staff_name}\n\n"
-                "Теперь вы будете получать уведомления когда клиенты приходят.",
-                parse_mode=ParseMode.HTML
-            )
             return
     
     # Обычная обработка текста
@@ -1183,7 +1236,7 @@ async def records_checker():
 # ==================== УВЕДОМЛЕНИЯ СОТРУДНИКАМ ====================
 
 async def notify_staff_client_arrived(record: dict):
-    """Уведомить сотрудников о приходе клиента"""
+    """Уведомить мастера о приходе его клиента"""
     try:
         # Получаем данные о записи
         client = record.get("client") or {}
@@ -1195,37 +1248,40 @@ async def notify_staff_client_arrived(record: dict):
         
         staff_info = record.get("staff") or {}
         staff_name = staff_info.get("name", "Мастер") if isinstance(staff_info, dict) else "Мастер"
+        yclients_staff_id = staff_info.get("id") if isinstance(staff_info, dict) else None
         
         datetime_str = record.get("datetime", "")
         time_str = format_record_datetime(datetime_str) if datetime_str else ""
         
         # Формируем сообщение
-        message = (
-            f"🔔 <b>Клиент пришёл!</b>\n\n"
+        msg = (
+            f"🔔 <b>К вам пришёл клиент!</b>\n\n"
             f"👤 {client_name}\n"
             f"📞 {client_phone}\n"
             f"✂️ {services}\n"
-            f"🗓 {time_str}\n"
-            f"👨‍💼 Мастер: {staff_name}"
+            f"🗓 {time_str}"
         )
         
-        # Отправляем всем зарегистрированным сотрудникам
-        staff_ids = get_all_staff_telegram_ids()
-        
-        if not staff_ids:
-            logger.info("Нет зарегистрированных сотрудников для уведомления")
-            return
-        
-        for telegram_id in staff_ids:
-            try:
-                await bot.send_message(
-                    telegram_id,
-                    message,
-                    parse_mode=ParseMode.HTML
-                )
-                logger.info(f"Уведомление о приходе отправлено сотруднику {telegram_id}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки сотруднику {telegram_id}: {e}")
+        # Ищем зарегистрированного мастера по YClients ID
+        if yclients_staff_id:
+            staff_data = get_staff_by_yclients_id(yclients_staff_id)
+            
+            if staff_data:
+                telegram_id = staff_data[0]
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        msg,
+                        parse_mode=ParseMode.HTML
+                    )
+                    logger.info(f"Уведомление о приходе отправлено мастеру {staff_name} ({telegram_id})")
+                    return
+                except Exception as e:
+                    logger.error(f"Ошибка отправки мастеру {telegram_id}: {e}")
+            else:
+                logger.info(f"Мастер {staff_name} (ID: {yclients_staff_id}) не зарегистрирован в боте")
+        else:
+            logger.info("В записи нет ID мастера")
                 
     except Exception as e:
         logger.error(f"Ошибка notify_staff_client_arrived: {e}")
