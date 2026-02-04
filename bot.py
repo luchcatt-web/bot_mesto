@@ -128,6 +128,7 @@ def format_record_datetime(datetime_str: str) -> str:
         return datetime_str
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -165,6 +166,12 @@ CHECK_INTERVAL = 60  # Проверяем каждую минуту
 
 # Минимальный перенос для уведомления (в минутах)
 MIN_RESCHEDULE_MINUTES = 15
+
+# Секретный код для регистрации сотрудников
+STAFF_SECRET_CODE = "mesto2024"
+
+# Порт для webhook сервера
+WEBHOOK_PORT = 8080
 
 # ==================== ЛОГИРОВАНИЕ ====================
 
@@ -219,6 +226,19 @@ def init_db():
             notification_type TEXT NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(record_id, notification_type)
+        )
+    """)
+    
+    # Таблица сотрудников
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS staff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            staff_name TEXT NOT NULL,
+            yclients_staff_id INTEGER,
+            phone_number TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
@@ -349,6 +369,51 @@ def mark_notification_sent(record_id: int, notification_type: str):
     )
     conn.commit()
     conn.close()
+
+
+def save_staff(telegram_id: int, staff_name: str, yclients_staff_id: int = None, phone: str = None):
+    """Сохранение сотрудника"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO staff (telegram_id, staff_name, yclients_staff_id, phone_number)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                staff_name = excluded.staff_name,
+                yclients_staff_id = excluded.yclients_staff_id,
+                phone_number = excluded.phone_number
+        """, (telegram_id, staff_name, yclients_staff_id, phone))
+        conn.commit()
+        logger.info(f"Сотрудник сохранён: {staff_name} (Telegram ID: {telegram_id})")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения сотрудника: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_all_staff_telegram_ids():
+    """Получить Telegram ID всех активных сотрудников"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id FROM staff WHERE is_active = 1")
+    results = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in results]
+
+
+def get_staff_by_yclients_id(yclients_staff_id: int):
+    """Получить сотрудника по YClients ID"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id, staff_name FROM staff WHERE yclients_staff_id = ? AND is_active = 1", 
+                   (yclients_staff_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
 
 
 def normalize_phone(phone: str) -> str:
@@ -492,6 +557,72 @@ async def cmd_start(message: Message):
 @dp.message(Command("myrecords"))
 async def cmd_my_records(message: Message):
     await show_my_records(message)
+
+
+# Временное хранилище для регистрации сотрудников
+staff_registration = {}
+
+
+@dp.message(Command("staff"))
+async def cmd_staff(message: Message):
+    """Команда /staff для регистрации сотрудников"""
+    await message.answer(
+        "👨‍💼 <b>Регистрация сотрудника</b>\n\n"
+        "Введите секретный код для регистрации:",
+        parse_mode=ParseMode.HTML
+    )
+    staff_registration[message.from_user.id] = {"step": "code"}
+
+
+@dp.message(F.text)
+async def handle_staff_registration(message: Message):
+    """Обработка регистрации сотрудника"""
+    user_id = message.from_user.id
+    
+    # Проверяем, идёт ли регистрация сотрудника
+    if user_id in staff_registration:
+        reg_data = staff_registration[user_id]
+        
+        if reg_data.get("step") == "code":
+            if message.text == STAFF_SECRET_CODE:
+                staff_registration[user_id] = {"step": "name"}
+                await message.answer(
+                    "✅ Код верный!\n\n"
+                    "Введите ваше имя (как в YClients):",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                del staff_registration[user_id]
+                await message.answer("❌ Неверный код. Попробуйте /staff заново.")
+            return
+        
+        elif reg_data.get("step") == "name":
+            staff_name = message.text.strip()
+            
+            # Сохраняем сотрудника
+            save_staff(
+                telegram_id=user_id,
+                staff_name=staff_name,
+                phone=None
+            )
+            
+            del staff_registration[user_id]
+            
+            await message.answer(
+                f"✅ <b>Вы зарегистрированы как сотрудник!</b>\n\n"
+                f"👤 Имя: {staff_name}\n\n"
+                "Теперь вы будете получать уведомления когда клиенты приходят.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    
+    # Если не регистрация - обычная обработка
+    await handle_text_fallback(message)
+
+
+async def handle_text_fallback(message: Message):
+    """Обработка обычных текстовых сообщений"""
+    await handle_text_original(message)
 
 
 @dp.message(F.text == "📅 Мои записи")
@@ -671,8 +802,7 @@ async def handle_calendar_callback(callback: CallbackQuery):
     await callback.answer("📅 Файл для Apple календаря!")
 
 
-@dp.message(F.text)
-async def handle_text(message: Message):
+async def handle_text_original(message: Message):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM clients WHERE telegram_id = ?", (message.from_user.id,))
@@ -1026,6 +1156,114 @@ async def records_checker():
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+# ==================== УВЕДОМЛЕНИЯ СОТРУДНИКАМ ====================
+
+async def notify_staff_client_arrived(record_data: dict):
+    """Уведомить сотрудников о приходе клиента"""
+    try:
+        # Получаем данные о записи
+        client_name = record_data.get("client", {}).get("name", "Клиент")
+        client_phone = record_data.get("client", {}).get("phone", "")
+        
+        services_list = record_data.get("services") or []
+        services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+        
+        staff_info = record_data.get("staff") or {}
+        staff_name = staff_info.get("name", "Мастер") if isinstance(staff_info, dict) else "Мастер"
+        staff_id = staff_info.get("id") if isinstance(staff_info, dict) else None
+        
+        datetime_str = record_data.get("datetime", "")
+        time_str = ""
+        if datetime_str:
+            try:
+                if "T" in datetime_str:
+                    dt = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                else:
+                    dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+                time_str = dt.strftime("%H:%M")
+            except:
+                time_str = datetime_str
+        
+        # Формируем сообщение
+        message = (
+            f"🔔 <b>Клиент пришёл!</b>\n\n"
+            f"👤 {client_name}\n"
+            f"📞 {client_phone}\n"
+            f"✂️ {services}\n"
+            f"🕐 Время записи: {time_str}\n"
+            f"👨‍💼 Мастер: {staff_name}"
+        )
+        
+        # Отправляем всем сотрудникам
+        staff_ids = get_all_staff_telegram_ids()
+        
+        for telegram_id in staff_ids:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    message,
+                    parse_mode=ParseMode.HTML
+                )
+                logger.info(f"Уведомление о приходе отправлено сотруднику {telegram_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки сотруднику {telegram_id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка notify_staff_client_arrived: {e}")
+
+
+# ==================== WEBHOOK СЕРВЕР ====================
+
+async def handle_yclients_webhook(request: web.Request):
+    """Обработчик webhook от YClients"""
+    try:
+        data = await request.json()
+        logger.info(f"Webhook получен: {json.dumps(data, ensure_ascii=False, indent=2)}")
+        
+        # YClients отправляет разные типы событий
+        # visit_created - когда клиент отмечен как пришедший
+        # record_created - новая запись
+        # record_updated - изменение записи
+        
+        resource = data.get("resource")
+        status = data.get("status")
+        data_payload = data.get("data", {})
+        
+        # Проверяем статус "Клиент пришёл" (attendance или visit)
+        if resource == "record":
+            visit_attendance = data_payload.get("visit_attendance")
+            attendance = data_payload.get("attendance")
+            
+            # Если клиент пришёл (visit_attendance = 1 или attendance = 1)
+            if visit_attendance == 1 or attendance == 1:
+                logger.info("Клиент отмечен как пришедший!")
+                await notify_staff_client_arrived(data_payload)
+        
+        # Также проверяем если это отдельное событие visit
+        elif resource == "visit":
+            logger.info("Visit событие получено")
+            await notify_staff_client_arrived(data_payload)
+        
+        return web.json_response({"status": "ok"})
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки webhook: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def start_webhook_server():
+    """Запуск webhook сервера"""
+    app = web.Application()
+    app.router.add_post("/webhook/yclients", handle_yclients_webhook)
+    app.router.add_get("/health", lambda r: web.json_response({"status": "healthy"}))
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    logger.info(f"Webhook сервер запущен на порту {WEBHOOK_PORT}")
+
+
 # ==================== ЗАПУСК ====================
 
 async def main():
@@ -1034,11 +1272,15 @@ async def main():
     
     await bot.delete_webhook(drop_pending_updates=True)
     
+    # Запускаем webhook сервер для YClients
+    await start_webhook_server()
+    
     # Запускаем проверку записей
     asyncio.create_task(records_checker())
     
     logger.info("🚀 Бот запущен!")
     logger.info(f"⏱ Проверка записей каждые {CHECK_INTERVAL} сек")
+    logger.info(f"🌐 Webhook сервер на порту {WEBHOOK_PORT}")
     
     await dp.start_polling(bot)
 
