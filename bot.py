@@ -177,15 +177,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== S3 ХРАНИЛИЩЕ ====================
+
+S3_ACCESS_KEY = "ez123222"
+S3_SECRET_KEY = "BXA0Dyp23tTwbMKgIcrtMA0IyEaKMpjG2tlptQy9"
+S3_BUCKET = "09756767-976b-412c-8e2b-dc5b155d26a8"
+S3_ENDPOINT = "https://s3.twcstorage.ru"
+S3_DB_KEY = "clients.db"
+
 # ==================== БАЗА ДАННЫХ ====================
 
-# Используем /data для постоянного хранилища (не удаляется при обновлении)
-DATA_DIR = Path("/data")
-if DATA_DIR.exists():
-    DB_PATH = DATA_DIR / "clients.db"
-else:
-    # Локально используем текущую папку
-    DB_PATH = Path(__file__).parent / "clients.db"
+DB_PATH = Path(__file__).parent / "clients.db"
+
+
+def sync_db_from_s3():
+    """Скачать базу данных из S3 при старте"""
+    try:
+        import boto3
+        from botocore.config import Config
+        
+        s3 = boto3.client(
+            's3',
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=Config(signature_version='s3v4')
+        )
+        
+        s3.download_file(S3_BUCKET, S3_DB_KEY, str(DB_PATH))
+        logger.info("✅ База данных загружена из S3")
+        return True
+    except Exception as e:
+        logger.info(f"База в S3 не найдена или ошибка: {e}")
+        return False
+
+
+def sync_db_to_s3():
+    """Загрузить базу данных в S3"""
+    try:
+        import boto3
+        from botocore.config import Config
+        
+        s3 = boto3.client(
+            's3',
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=Config(signature_version='s3v4')
+        )
+        
+        s3.upload_file(str(DB_PATH), S3_BUCKET, S3_DB_KEY)
+        logger.info("✅ База данных сохранена в S3")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения в S3: {e}")
+        return False
 
 
 def init_db():
@@ -281,6 +327,10 @@ def save_client(telegram_id: int, phone: str, first_name: str = None,
         """, (telegram_id, phone, first_name, last_name, username))
         conn.commit()
         logger.info(f"Клиент сохранён: {phone} (Telegram ID: {telegram_id})")
+        
+        # Сохраняем базу в S3
+        sync_db_to_s3()
+        
         return True
     except Exception as e:
         logger.error(f"Ошибка сохранения клиента: {e}")
@@ -397,6 +447,10 @@ def save_staff(telegram_id: int, staff_name: str, yclients_staff_id: int = None,
         """, (telegram_id, staff_name, yclients_staff_id, phone))
         conn.commit()
         logger.info(f"Сотрудник сохранён: {staff_name} (Telegram ID: {telegram_id})")
+        
+        # Сохраняем базу в S3
+        sync_db_to_s3()
+        
         return True
     except Exception as e:
         logger.error(f"Ошибка сохранения сотрудника: {e}")
@@ -1357,6 +1411,10 @@ async def notify_staff_client_arrived(record: dict):
 
 async def main():
     """Запуск бота"""
+    # Сначала пробуем загрузить базу из S3
+    sync_db_from_s3()
+    
+    # Инициализируем базу (создаст таблицы если их нет)
     init_db()
     
     await bot.delete_webhook(drop_pending_updates=True)
