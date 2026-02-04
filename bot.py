@@ -185,6 +185,18 @@ S3_BUCKET = "09756767-976b-412c-8e2b-dc5b155d26a8"
 S3_ENDPOINT = "https://s3.twcstorage.ru"
 S3_DB_KEY = "clients.db"
 
+# Резервные данные клиентов (не теряются при перезапуске)
+# Формат: telegram_id: phone
+BACKUP_CLIENTS = {
+    354738973: "+79999798000",  # Твой номер
+}
+
+# Резервные данные сотрудников
+# Формат: telegram_id: (staff_name, yclients_staff_id)
+BACKUP_STAFF = {
+    # Добавляй сюда сотрудников
+}
+
 # ==================== БАЗА ДАННЫХ ====================
 
 DB_PATH = Path(__file__).parent / "clients.db"
@@ -1409,6 +1421,30 @@ async def notify_staff_client_arrived(record: dict):
 
 # ==================== ЗАПУСК ====================
 
+def restore_backup_data():
+    """Восстановление резервных данных из кода"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Восстанавливаем клиентов
+    for telegram_id, phone in BACKUP_CLIENTS.items():
+        cursor.execute("""
+            INSERT OR IGNORE INTO clients (telegram_id, phone_number)
+            VALUES (?, ?)
+        """, (telegram_id, phone))
+    
+    # Восстанавливаем сотрудников
+    for telegram_id, (staff_name, yclients_id) in BACKUP_STAFF.items():
+        cursor.execute("""
+            INSERT OR IGNORE INTO staff (telegram_id, staff_name, yclients_staff_id)
+            VALUES (?, ?, ?)
+        """, (telegram_id, staff_name, yclients_id))
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ Восстановлено {len(BACKUP_CLIENTS)} клиентов и {len(BACKUP_STAFF)} сотрудников из резерва")
+
+
 async def main():
     """Запуск бота"""
     # Сначала пробуем загрузить базу из S3
@@ -1416,6 +1452,9 @@ async def main():
     
     # Инициализируем базу (создаст таблицы если их нет)
     init_db()
+    
+    # Восстанавливаем резервные данные
+    restore_backup_data()
     
     await bot.delete_webhook(drop_pending_updates=True)
     
