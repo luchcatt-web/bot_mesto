@@ -128,7 +128,6 @@ def format_record_datetime(datetime_str: str) -> str:
         return datetime_str
 
 import aiohttp
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -169,9 +168,6 @@ MIN_RESCHEDULE_MINUTES = 15
 
 # Секретный код для регистрации сотрудников
 STAFF_SECRET_CODE = "mesto2024"
-
-# Порт для webhook сервера
-WEBHOOK_PORT = 8080
 
 # ==================== ЛОГИРОВАНИЕ ====================
 
@@ -239,6 +235,14 @@ def init_db():
             phone_number TEXT,
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Таблица для отслеживания статуса "пришёл"
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attendance_notified (
+            record_id INTEGER PRIMARY KEY,
+            notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
@@ -414,6 +418,25 @@ def get_staff_by_yclients_id(yclients_staff_id: int):
     result = cursor.fetchone()
     conn.close()
     return result
+
+
+def is_attendance_notified(record_id: int) -> bool:
+    """Проверить, было ли уже отправлено уведомление о приходе"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM attendance_notified WHERE record_id = ?", (record_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+
+def mark_attendance_notified(record_id: int):
+    """Отметить, что уведомление о приходе отправлено"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO attendance_notified (record_id) VALUES (?)", (record_id,))
+    conn.commit()
+    conn.close()
 
 
 def normalize_phone(phone: str) -> str:
@@ -1128,6 +1151,16 @@ async def check_records():
                             mark_notification_sent(record_id, "reminder_24h")
             except:
                 pass
+        
+        # Проверяем статус "пришёл" (attendance)
+        attendance = record.get("attendance")
+        visit_attendance = record.get("visit_attendance")
+        
+        # YClients использует attendance=1 или visit_attendance=1 когда клиент пришёл
+        if (attendance == 1 or visit_attendance == 1) and not is_attendance_notified(record_id):
+            logger.info(f"Клиент пришёл! Запись #{record_id}")
+            await notify_staff_client_arrived(record)
+            mark_attendance_notified(record_id)
     
     # Проверяем отменённые записи
     tracked_ids = get_all_tracked_record_ids()
@@ -1158,31 +1191,22 @@ async def records_checker():
 
 # ==================== УВЕДОМЛЕНИЯ СОТРУДНИКАМ ====================
 
-async def notify_staff_client_arrived(record_data: dict):
+async def notify_staff_client_arrived(record: dict):
     """Уведомить сотрудников о приходе клиента"""
     try:
         # Получаем данные о записи
-        client_name = record_data.get("client", {}).get("name", "Клиент")
-        client_phone = record_data.get("client", {}).get("phone", "")
+        client = record.get("client") or {}
+        client_name = client.get("name", "Клиент") if isinstance(client, dict) else "Клиент"
+        client_phone = client.get("phone", "") if isinstance(client, dict) else ""
         
-        services_list = record_data.get("services") or []
+        services_list = record.get("services") or []
         services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
         
-        staff_info = record_data.get("staff") or {}
+        staff_info = record.get("staff") or {}
         staff_name = staff_info.get("name", "Мастер") if isinstance(staff_info, dict) else "Мастер"
-        staff_id = staff_info.get("id") if isinstance(staff_info, dict) else None
         
-        datetime_str = record_data.get("datetime", "")
-        time_str = ""
-        if datetime_str:
-            try:
-                if "T" in datetime_str:
-                    dt = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                else:
-                    dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
-                time_str = dt.strftime("%H:%M")
-            except:
-                time_str = datetime_str
+        datetime_str = record.get("datetime", "")
+        time_str = format_record_datetime(datetime_str) if datetime_str else ""
         
         # Формируем сообщение
         message = (
@@ -1190,12 +1214,16 @@ async def notify_staff_client_arrived(record_data: dict):
             f"👤 {client_name}\n"
             f"📞 {client_phone}\n"
             f"✂️ {services}\n"
-            f"🕐 Время записи: {time_str}\n"
+            f"🗓 {time_str}\n"
             f"👨‍💼 Мастер: {staff_name}"
         )
         
-        # Отправляем всем сотрудникам
+        # Отправляем всем зарегистрированным сотрудникам
         staff_ids = get_all_staff_telegram_ids()
+        
+        if not staff_ids:
+            logger.info("Нет зарегистрированных сотрудников для уведомления")
+            return
         
         for telegram_id in staff_ids:
             try:
@@ -1212,56 +1240,6 @@ async def notify_staff_client_arrived(record_data: dict):
         logger.error(f"Ошибка notify_staff_client_arrived: {e}")
 
 
-# ==================== WEBHOOK СЕРВЕР ====================
-
-async def handle_yclients_webhook(request: web.Request):
-    """Обработчик webhook от YClients"""
-    try:
-        data = await request.json()
-        logger.info(f"Webhook получен: {json.dumps(data, ensure_ascii=False, indent=2)}")
-        
-        # YClients отправляет разные типы событий
-        # visit_created - когда клиент отмечен как пришедший
-        # record_created - новая запись
-        # record_updated - изменение записи
-        
-        resource = data.get("resource")
-        status = data.get("status")
-        data_payload = data.get("data", {})
-        
-        # Проверяем статус "Клиент пришёл" (attendance или visit)
-        if resource == "record":
-            visit_attendance = data_payload.get("visit_attendance")
-            attendance = data_payload.get("attendance")
-            
-            # Если клиент пришёл (visit_attendance = 1 или attendance = 1)
-            if visit_attendance == 1 or attendance == 1:
-                logger.info("Клиент отмечен как пришедший!")
-                await notify_staff_client_arrived(data_payload)
-        
-        # Также проверяем если это отдельное событие visit
-        elif resource == "visit":
-            logger.info("Visit событие получено")
-            await notify_staff_client_arrived(data_payload)
-        
-        return web.json_response({"status": "ok"})
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки webhook: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def start_webhook_server():
-    """Запуск webhook сервера"""
-    app = web.Application()
-    app.router.add_post("/webhook/yclients", handle_yclients_webhook)
-    app.router.add_get("/health", lambda r: web.json_response({"status": "healthy"}))
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
-    await site.start()
-    logger.info(f"Webhook сервер запущен на порту {WEBHOOK_PORT}")
 
 
 # ==================== ЗАПУСК ====================
@@ -1272,15 +1250,11 @@ async def main():
     
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Запускаем webhook сервер для YClients
-    await start_webhook_server()
-    
     # Запускаем проверку записей
     asyncio.create_task(records_checker())
     
     logger.info("🚀 Бот запущен!")
     logger.info(f"⏱ Проверка записей каждые {CHECK_INTERVAL} сек")
-    logger.info(f"🌐 Webhook сервер на порту {WEBHOOK_PORT}")
     
     await dp.start_polling(bot)
 
