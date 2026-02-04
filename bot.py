@@ -38,6 +38,75 @@ MONTHS_RU = {
 }
 
 
+def generate_ics_file(record: dict) -> bytes:
+    """Генерация .ics файла для добавления в календарь"""
+    datetime_str = record.get("datetime", "")
+    services_list = record.get("services") or []
+    services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    
+    staff = record.get("staff") or {}
+    staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    
+    record_id = record.get("id", "0")
+    
+    # Парсим дату
+    try:
+        if "T" in datetime_str:
+            dt_start = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            dt_start = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+    except:
+        dt_start = datetime.now() + timedelta(days=1)
+    
+    # Длительность услуги (по умолчанию 1 час)
+    duration_minutes = 60
+    for s in services_list:
+        if isinstance(s, dict) and s.get("length"):
+            duration_minutes = s.get("length", 60)
+            break
+    
+    dt_end = dt_start + timedelta(minutes=duration_minutes)
+    
+    # Форматируем даты для ICS
+    dt_format = "%Y%m%dT%H%M%S"
+    dt_start_str = dt_start.strftime(dt_format)
+    dt_end_str = dt_end.strftime(dt_format)
+    dt_now_str = datetime.now().strftime(dt_format)
+    
+    # Напоминание за 1 час
+    ics_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Место Барбершоп//RU
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+UID:{record_id}@mesto-barbershop
+DTSTAMP:{dt_now_str}
+DTSTART:{dt_start_str}
+DTEND:{dt_end_str}
+SUMMARY:{services}
+DESCRIPTION:Мастер: {staff_name}\\nТелефон: {BARBERSHOP_PHONE}
+LOCATION:{BARBERSHOP_ADDRESS}
+BEGIN:VALARM
+TRIGGER:-PT1H
+ACTION:DISPLAY
+DESCRIPTION:Напоминание: {services} через 1 час
+END:VALARM
+BEGIN:VALARM
+TRIGGER:-PT15M
+ACTION:DISPLAY
+DESCRIPTION:Напоминание: {services} через 15 минут
+END:VALARM
+END:VEVENT
+END:VCALENDAR"""
+    
+    return ics_content.encode('utf-8')
+
+
+# Хранилище записей для callback (временное)
+records_cache = {}
+
+
 def format_record_datetime(datetime_str: str) -> str:
     """Форматирование даты и времени записи: '5 февраля (среда) в 13:30'"""
     if not datetime_str:
@@ -68,6 +137,8 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    CallbackQuery,
+    BufferedInputFile,
 )
 from aiogram.enums import ParseMode
 
@@ -566,6 +637,40 @@ async def handle_contact_button(message: Message):
     )
 
 
+@dp.callback_query(F.data.startswith("calendar_"))
+async def handle_calendar_callback(callback: CallbackQuery):
+    """Обработчик кнопки Добавить в календарь"""
+    record_id = callback.data.replace("calendar_", "")
+    
+    # Получаем запись из кэша
+    record = records_cache.get(record_id)
+    
+    if not record:
+        await callback.answer("⚠️ Запись не найдена. Попробуйте снова через 'Мои записи'.", show_alert=True)
+        return
+    
+    # Генерируем .ics файл
+    ics_content = generate_ics_file(record)
+    
+    # Получаем информацию для имени файла
+    services_list = record.get("services") or []
+    service_name = services_list[0].get("title", "Запись") if services_list else "Запись"
+    
+    # Отправляем файл
+    ics_file = BufferedInputFile(
+        ics_content,
+        filename=f"Место_{service_name.replace(' ', '_')}.ics"
+    )
+    
+    await callback.message.answer_document(
+        ics_file,
+        caption="📅 Откройте файл чтобы добавить запись в календарь.\n\n"
+                "✅ Напоминания: за 1 час и за 15 минут до визита."
+    )
+    
+    await callback.answer("📅 Файл календаря отправлен!")
+
+
 @dp.message(F.text)
 async def handle_text(message: Message):
     conn = sqlite3.connect(DB_PATH)
@@ -616,8 +721,14 @@ def get_record_link(record: dict) -> str:
 def get_single_record_keyboard(record: dict):
     """Кнопки для конкретной записи с персональной ссылкой"""
     record_link = get_record_link(record)
+    record_id = record.get("id", 0)
+    
+    # Сохраняем запись в кэш для callback
+    records_cache[str(record_id)] = record
+    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить / Отменить", url=record_link)],
+        [InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"calendar_{record_id}")],
         [InlineKeyboardButton(text="📍 Как добраться", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
     ])
 
