@@ -664,11 +664,11 @@ async def handle_calendar_callback(callback: CallbackQuery):
     
     await callback.message.answer_document(
         ics_file,
-        caption="📅 Откройте файл чтобы добавить запись в календарь.\n\n"
-                "✅ Напоминания: за 1 час и за 15 минут до визита."
+        caption="📅 Откройте файл → добавится в календарь iPhone.\n\n"
+                "✅ Напоминания: за 1 час и за 15 минут."
     )
     
-    await callback.answer("📅 Файл календаря отправлен!")
+    await callback.answer("📅 Файл для Apple календаря!")
 
 
 @dp.message(F.text)
@@ -718,17 +718,62 @@ def get_record_link(record: dict) -> str:
     return YCLIENTS_BOOKING_URL
 
 
+def get_google_calendar_url(record: dict) -> str:
+    """Генерация ссылки на Google Calendar"""
+    datetime_str = record.get("datetime", "")
+    services_list = record.get("services") or []
+    services = ", ".join([s.get("title", "") for s in services_list if isinstance(s, dict)])
+    
+    staff = record.get("staff") or {}
+    staff_name = staff.get("name", "") if isinstance(staff, dict) else ""
+    
+    # Парсим дату
+    try:
+        if "T" in datetime_str:
+            dt_start = datetime.fromisoformat(datetime_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            dt_start = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+    except:
+        dt_start = datetime.now() + timedelta(days=1)
+    
+    # Длительность услуги
+    duration_minutes = 60
+    for s in services_list:
+        if isinstance(s, dict) and s.get("length"):
+            duration_minutes = s.get("length", 60)
+            break
+    
+    dt_end = dt_start + timedelta(minutes=duration_minutes)
+    
+    # Формат для Google Calendar: 20260205T133000
+    dt_format = "%Y%m%dT%H%M%S"
+    dates = f"{dt_start.strftime(dt_format)}/{dt_end.strftime(dt_format)}"
+    
+    # URL-encode параметры
+    from urllib.parse import quote
+    
+    title = quote(f"{BARBERSHOP_NAME}: {services}")
+    details = quote(f"Мастер: {staff_name}\nТелефон: {BARBERSHOP_PHONE}")
+    location = quote(BARBERSHOP_ADDRESS)
+    
+    return f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={title}&dates={dates}&details={details}&location={location}"
+
+
 def get_single_record_keyboard(record: dict):
     """Кнопки для конкретной записи с персональной ссылкой"""
     record_link = get_record_link(record)
     record_id = record.get("id", 0)
+    google_cal_url = get_google_calendar_url(record)
     
     # Сохраняем запись в кэш для callback
     records_cache[str(record_id)] = record
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить / Отменить", url=record_link)],
-        [InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"calendar_{record_id}")],
+        [
+            InlineKeyboardButton(text="📅 Google", url=google_cal_url),
+            InlineKeyboardButton(text="📅 Apple", callback_data=f"calendar_{record_id}")
+        ],
         [InlineKeyboardButton(text="📍 Как добраться", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
     ])
 
