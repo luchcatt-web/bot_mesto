@@ -161,7 +161,7 @@ BARBERSHOP_ADDRESS = "ул. Войстроченко, 10"
 BARBERSHOP_PHONE = "+7 (4832) 377-888"
 
 # Интервал проверки записей (в секундах)
-CHECK_INTERVAL = 30  # Проверяем каждые 30 секунд
+CHECK_INTERVAL = 15  # Проверяем каждые 15 секунд
 
 # Минимальный перенос для уведомления (в минутах)
 MIN_RESCHEDULE_MINUTES = 15
@@ -409,6 +409,16 @@ def get_all_staff_telegram_ids():
     return [r[0] for r in results]
 
 
+def get_registered_yclients_staff_ids():
+    """Получить список YClients ID уже зарегистрированных сотрудников"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT yclients_staff_id FROM staff WHERE is_active = 1 AND yclients_staff_id IS NOT NULL")
+    results = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in results]
+
+
 def get_staff_by_yclients_id(yclients_staff_id: int):
     """Получить сотрудника по YClients ID"""
     conn = sqlite3.connect(DB_PATH)
@@ -460,6 +470,14 @@ class YClientsAPI:
         self.partner_token = partner_token
         self.user_token = user_token
         self.company_id = company_id
+        self._session = None
+    
+    async def _get_session(self):
+        """Получить или создать сессию"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
     
     def _headers(self) -> dict:
         return {
@@ -478,14 +496,14 @@ class YClientsAPI:
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self._headers(), params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("data", [])
-                    else:
-                        logger.error(f"YClients API error: {resp.status}")
-                        return []
+            session = await self._get_session()
+            async with session.get(url, headers=self._headers(), params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("data", [])
+                else:
+                    logger.error(f"YClients API error: {resp.status}")
+                    return []
         except Exception as e:
             logger.error(f"YClients API exception: {e}")
             return []
@@ -501,14 +519,14 @@ class YClientsAPI:
         url = f"{self.BASE_URL}/company/{self.company_id}/staff"
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self._headers()) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("data", [])
-                    else:
-                        logger.error(f"YClients Staff API error: {resp.status}")
-                        return []
+            session = await self._get_session()
+            async with session.get(url, headers=self._headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("data", [])
+                else:
+                    logger.error(f"YClients Staff API error: {resp.status}")
+                    return []
         except Exception as e:
             logger.error(f"YClients Staff API exception: {e}")
             return []
@@ -843,11 +861,16 @@ async def handle_text(message: Message):
                     del staff_registration[user_id]
                     return
                 
-                # Создаём кнопки для выбора мастера
+                # Получаем уже зарегистрированных
+                registered_ids = get_registered_yclients_staff_ids()
+                
+                # Создаём кнопки для выбора мастера (исключаем зарегистрированных)
                 buttons = []
-                staff_names = {}  # Сохраняем имена для callback
+                staff_names = {}
                 for staff in staff_list:
                     staff_id = staff.get("id")
+                    if staff_id in registered_ids:
+                        continue  # Пропускаем уже зарегистрированных
                     staff_name = staff.get("name", "Без имени")
                     staff_names[staff_id] = staff_name
                     buttons.append([InlineKeyboardButton(
@@ -855,12 +878,17 @@ async def handle_text(message: Message):
                         callback_data=f"staff_select_{staff_id}"
                     )])
                 
+                if not buttons:
+                    await message.answer("✅ Все мастера уже зарегистрированы!")
+                    del staff_registration[user_id]
+                    return
+                
                 staff_registration[user_id] = {"step": "select", "staff_names": staff_names}
                 keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
                 
                 await message.answer(
                     "✅ Код верный!\n\n"
-                    "Выберите себя из списка мастеров:",
+                    "Выберите себя:",
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard
                 )
