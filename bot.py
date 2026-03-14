@@ -885,12 +885,14 @@ async def handle_booking_button(message: Message):
 async def handle_contact_button(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📞 Позвонить", url=f"tel:+74832377888")],
+        [InlineKeyboardButton(text="💬 Написать администратору", url="https://t.me/mesto_adminn")],
         [InlineKeyboardButton(text="📍 На карте", url=f"https://yandex.ru/maps/?text={BARBERSHOP_ADDRESS.replace(' ', '+')}")]
     ])
     await message.answer(
         f"📍 <b>{BARBERSHOP_NAME}</b>\n\n"
         f"🏠 {BARBERSHOP_ADDRESS}\n"
-        f"📞 {BARBERSHOP_PHONE}",
+        f"📞 {BARBERSHOP_PHONE}\n\n"
+        "Нажмите на кнопку ниже, чтобы написать администратору напрямую.",
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
